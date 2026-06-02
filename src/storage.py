@@ -51,6 +51,10 @@ def init_db() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 project_id INTEGER NOT NULL,
                 payload TEXT NOT NULL,
+                review_status TEXT DEFAULT '待复核',
+                review_comment TEXT DEFAULT '',
+                reviewer TEXT DEFAULT '',
+                reviewed_at TEXT DEFAULT '',
                 created_at TEXT NOT NULL
             )
             """
@@ -66,7 +70,29 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS uploaded_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                file_name TEXT NOT NULL,
+                file_type TEXT,
+                summary TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        ensure_column(conn, "findings", "review_status", "TEXT DEFAULT '待复核'")
+        ensure_column(conn, "findings", "review_comment", "TEXT DEFAULT ''")
+        ensure_column(conn, "findings", "reviewer", "TEXT DEFAULT ''")
+        ensure_column(conn, "findings", "reviewed_at", "TEXT DEFAULT ''")
         conn.commit()
+
+
+def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    columns = [row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def now() -> str:
@@ -139,6 +165,7 @@ def save_step_input(project_id: int, step_id: str, payload: Dict[str, Any]) -> N
             """,
             (project_id, step_id, json.dumps(payload, ensure_ascii=False), now()),
         )
+        conn.execute("INSERT INTO audit_logs(project_id, action, detail, created_at) VALUES (?, ?, ?, ?)", (project_id, "保存步骤", step_id, now()))
         conn.commit()
 
 
@@ -151,8 +178,8 @@ def load_step_inputs(project_id: int) -> Dict[str, Dict[str, Any]]:
 def save_finding(project_id: int, payload: Dict[str, Any]) -> int:
     with get_conn() as conn:
         cur = conn.execute(
-            "INSERT INTO findings(project_id, payload, created_at) VALUES (?, ?, ?)",
-            (project_id, json.dumps(payload, ensure_ascii=False), now()),
+            "INSERT INTO findings(project_id, payload, review_status, created_at) VALUES (?, ?, ?, ?)",
+            (project_id, json.dumps(payload, ensure_ascii=False), "待复核", now()),
         )
         conn.execute("INSERT INTO audit_logs(project_id, action, detail, created_at) VALUES (?, ?, ?, ?)", (project_id, "新增发现", payload.get("问题标题", ""), now()))
         conn.commit()
@@ -161,8 +188,43 @@ def save_finding(project_id: int, payload: Dict[str, Any]) -> int:
 
 def load_findings(project_id: int) -> List[Dict[str, Any]]:
     with get_conn() as conn:
-        rows = conn.execute("SELECT payload FROM findings WHERE project_id=? ORDER BY id ASC", (project_id,)).fetchall()
-    return [json.loads(row["payload"]) for row in rows]
+        rows = conn.execute("SELECT id, payload, review_status, review_comment, reviewer, reviewed_at FROM findings WHERE project_id=? ORDER BY id ASC", (project_id,)).fetchall()
+    result: List[Dict[str, Any]] = []
+    for row in rows:
+        payload = json.loads(row["payload"])
+        payload["记录ID"] = row["id"]
+        payload["复核状态"] = row["review_status"]
+        payload["复核意见"] = row["review_comment"]
+        payload["复核人"] = row["reviewer"]
+        payload["复核时间"] = row["reviewed_at"]
+        result.append(payload)
+    return result
+
+
+def update_finding_review(project_id: int, finding_id: int, status: str, comment: str, reviewer: str) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE findings SET review_status=?, review_comment=?, reviewer=?, reviewed_at=? WHERE id=? AND project_id=?",
+            (status, comment, reviewer, now(), finding_id, project_id),
+        )
+        conn.execute("INSERT INTO audit_logs(project_id, action, detail, created_at) VALUES (?, ?, ?, ?)", (project_id, "复核发现", f"ID={finding_id}; 状态={status}", now()))
+        conn.commit()
+
+
+def save_uploaded_file_summary(project_id: int, file_name: str, file_type: str, summary: str) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO uploaded_files(project_id, file_name, file_type, summary, created_at) VALUES (?, ?, ?, ?, ?)",
+            (project_id, file_name, file_type, summary, now()),
+        )
+        conn.execute("INSERT INTO audit_logs(project_id, action, detail, created_at) VALUES (?, ?, ?, ?)", (project_id, "解析文件", file_name, now()))
+        conn.commit()
+
+
+def load_uploaded_files(project_id: int) -> List[Dict[str, Any]]:
+    with get_conn() as conn:
+        rows = conn.execute("SELECT * FROM uploaded_files WHERE project_id=? ORDER BY id DESC", (project_id,)).fetchall()
+    return [dict(row) for row in rows]
 
 
 def load_logs(project_id: Optional[int] = None) -> List[Dict[str, Any]]:
