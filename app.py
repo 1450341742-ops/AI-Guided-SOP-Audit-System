@@ -2,9 +2,12 @@ from datetime import datetime
 import pandas as pd
 import streamlit as st
 
+from src.auth import has_permission, login_box, logout_button
 from src.capa import build_capa_items
+from src.config_manager import load_workflow_config, reset_workflow_config, save_workflow_config, text_to_workflow, workflow_to_text
+from src.exporters import build_excel_package
+from src.file_parsers import parse_uploaded_file
 from src.guide_engine import (
-    DEFAULT_WORKFLOW,
     init_session,
     get_current_step,
     evaluate_current_step,
@@ -24,14 +27,24 @@ from src.storage import (
     load_findings,
     load_logs,
     load_step_inputs,
+    load_uploaded_files,
     save_finding,
     save_step_input,
+    save_uploaded_file_summary,
+    update_finding_review,
     update_project,
 )
 
 st.set_page_config(page_title="AI引导式稽查SOP执行系统", layout="wide")
+
+if not login_box():
+    st.stop()
+
 init_db()
 init_session()
+logout_button()
+
+WORKFLOW = load_workflow_config()
 
 st.markdown("""
 <style>
@@ -44,11 +57,14 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("AI引导式稽查SOP执行系统 V2")
-st.caption("已升级：项目持久化保存 + 知识库提示 + CAPA生成 + 操作日志。")
+st.title("AI引导式稽查SOP执行系统 V3")
+st.caption("已升级：账号权限 + 发现复核 + 文件解析 + Excel整包导出 + 后台流程配置。")
 
 st.session_state.setdefault("project_id", None)
 st.session_state.setdefault("selected_page", "现场引导")
+
+# 让guide_engine仍使用默认流程逻辑；V3配置主要用于页面展示和后续扩展。
+# 当前规则判断仍以guide_engine内置步骤ID为准，配置页可先用于调整提示和流程文案。
 
 with st.sidebar:
     st.header("项目管理")
@@ -79,11 +95,11 @@ with st.sidebar:
     })
     cnew, csave = st.columns(2)
     with cnew:
-        if st.button("新建保存", use_container_width=True):
+        if st.button("新建保存", use_container_width=True, disabled=not has_permission("create")):
             st.session_state.project_id = create_project(st.session_state.project)
             st.success(f"已创建项目ID：{st.session_state.project_id}")
     with csave:
-        if st.button("保存项目", use_container_width=True):
+        if st.button("保存项目", use_container_width=True, disabled=not has_permission("save")):
             if st.session_state.project_id:
                 update_project(st.session_state.project_id, st.session_state.project)
                 st.success("已保存")
@@ -92,15 +108,81 @@ with st.sidebar:
 
     st.divider()
     st.header("页面")
-    st.session_state.selected_page = st.radio("选择功能", ["现场引导", "CAPA计划", "项目日志"], label_visibility="collapsed")
+    pages = ["现场引导", "发现复核", "CAPA计划", "文件解析", "项目日志"]
+    if has_permission("config"):
+        pages.append("后台配置")
+    st.session_state.selected_page = st.radio("选择功能", pages, label_visibility="collapsed")
 
     st.divider()
     st.header("流程进度")
+    # 导航仍按guide_engine的当前步骤执行
+    from src.guide_engine import DEFAULT_WORKFLOW
     for i, step_item in enumerate(DEFAULT_WORKFLOW):
         icon = "已完成" if i in st.session_state.done_steps else ("当前" if i == st.session_state.current_index else "待执行")
         if st.button(f"{icon}｜{i+1}. {step_item['module']}", key=f"nav_{i}", use_container_width=True):
             st.session_state.current_index = i
             st.rerun()
+
+if st.session_state.selected_page == "后台配置":
+    st.subheader("后台流程配置")
+    if not has_permission("config"):
+        st.error("当前账号无后台配置权限。")
+        st.stop()
+    st.caption("当前配置页用于调整流程提示文案和字段。若JSON填写错误，可重置为默认配置。")
+    config_text = st.text_area("流程JSON配置", value=workflow_to_text(WORKFLOW), height=520)
+    col_a, col_b = st.columns(2)
+    with col_a:
+        if st.button("保存配置", type="primary"):
+            try:
+                workflow = text_to_workflow(config_text)
+                save_workflow_config(workflow)
+                st.success("配置已保存，刷新后生效。")
+            except Exception as exc:
+                st.error(f"配置保存失败：{exc}")
+    with col_b:
+        if st.button("恢复默认配置"):
+            reset_workflow_config()
+            st.success("已恢复默认配置。")
+    st.stop()
+
+if st.session_state.selected_page == "文件解析":
+    st.subheader("文件解析与资料预审")
+    if not st.session_state.project_id:
+        st.info("请先新建或加载项目。")
+        st.stop()
+    files = st.file_uploader("上传xlsx、csv、docx、txt文件", accept_multiple_files=True, type=["xlsx", "xls", "csv", "docx", "txt"])
+    if files:
+        for f in files:
+            parsed = parse_uploaded_file(f.name, f.getvalue())
+            save_uploaded_file_summary(st.session_state.project_id, f.name, parsed.get("type", ""), parsed.get("summary", ""))
+            with st.expander(f"{f.name}｜{parsed.get('type', '')}", expanded=True):
+                st.text(parsed.get("summary", ""))
+        st.success("文件解析摘要已保存。")
+    st.markdown("**历史解析记录**")
+    st.dataframe(pd.DataFrame(load_uploaded_files(st.session_state.project_id)), use_container_width=True)
+    st.stop()
+
+if st.session_state.selected_page == "发现复核":
+    st.subheader("发现复核")
+    if not st.session_state.project_id:
+        st.info("请先加载或新建项目。")
+        st.stop()
+    records = load_findings(st.session_state.project_id)
+    if not records:
+        st.info("暂无发现记录。")
+        st.stop()
+    for rec in records:
+        with st.expander(f"ID {rec.get('记录ID')}｜{rec.get('问题分类')}｜{rec.get('风险等级')}｜{rec.get('复核状态')}"):
+            st.write(rec.get("问题描述", ""))
+            st.write("证据来源：", rec.get("证据来源", ""))
+            st.write("建议措施：", rec.get("建议措施", ""))
+            status = st.selectbox("复核状态", ["待复核", "通过", "退回修改", "需升级确认"], index=["待复核", "通过", "退回修改", "需升级确认"].index(rec.get("复核状态", "待复核")) if rec.get("复核状态") in ["待复核", "通过", "退回修改", "需升级确认"] else 0, key=f"review_status_{rec.get('记录ID')}")
+            comment = st.text_area("复核意见", value=rec.get("复核意见", ""), key=f"review_comment_{rec.get('记录ID')}")
+            if st.button("保存复核", key=f"save_review_{rec.get('记录ID')}", disabled=not has_permission("review")):
+                update_finding_review(st.session_state.project_id, int(rec.get("记录ID")), status, comment, st.session_state.user.display_name)
+                st.success("复核已保存")
+                st.rerun()
+    st.stop()
 
 if st.session_state.selected_page == "CAPA计划":
     st.subheader("CAPA自动生成")
@@ -180,7 +262,7 @@ with mid:
             value = st.text_input(field["label"], value=current_value, key=widget_key)
         st.session_state.step_inputs[step["id"]][field["key"]] = value
 
-    if st.button("保存当前步骤信息"):
+    if st.button("保存当前步骤信息", disabled=not has_permission("save")):
         if st.session_state.project_id:
             save_step_input(st.session_state.project_id, step["id"], st.session_state.step_inputs[step["id"]])
             st.success("当前步骤已保存到数据库")
@@ -208,7 +290,7 @@ with mid:
             with st.expander("查看触发规则"):
                 for rule in result["triggered_rules"]:
                     st.write(f"- {rule}")
-        if st.button("根据判断生成标准记录"):
+        if st.button("根据判断生成标准记录", disabled=not has_permission("save")):
             finding = build_finding_from_current_step(result)
             st.session_state.records.append(finding)
             if st.session_state.project_id:
@@ -217,21 +299,25 @@ with mid:
 
 with right:
     st.subheader("发现记录区")
+    if st.session_state.project_id:
+        st.session_state.records = load_findings(st.session_state.project_id)
     if not st.session_state.records:
         st.caption("当前暂无记录。")
     else:
         for idx, rec in enumerate(st.session_state.records, start=1):
-            with st.expander(f"{idx}. {rec['问题分类']}｜{rec['风险等级']}｜{rec['问题标题']}", expanded=idx == len(st.session_state.records)):
-                for key in ["问题描述", "证据来源", "风险影响", "建议措施", "状态"]:
+            with st.expander(f"{idx}. {rec.get('问题分类')}｜{rec.get('风险等级')}｜{rec.get('复核状态', '待复核')}｜{rec.get('问题标题')}", expanded=idx == len(st.session_state.records)):
+                for key in ["问题描述", "证据来源", "风险影响", "建议措施", "复核意见", "状态"]:
                     st.write(f"**{key}：**", rec.get(key, ""))
 
     st.divider()
     st.subheader("导出")
     df = export_records_dataframe()
     csv = df.to_csv(index=False).encode("utf-8-sig")
-    st.download_button("下载问题清单CSV", data=csv, file_name="AI引导稽查问题清单.csv", mime="text/csv", use_container_width=True)
-    st.download_button("下载Word报告初稿", data=build_word_report(), file_name="AI引导式稽查报告初稿.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", use_container_width=True)
+    st.download_button("下载问题清单CSV", data=csv, file_name="AI引导稽查问题清单.csv", mime="text/csv", use_container_width=True, disabled=not has_permission("export"))
+    st.download_button("下载Word报告初稿", data=build_word_report(), file_name="AI引导式稽查报告初稿.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", use_container_width=True, disabled=not has_permission("export"))
+    logs_for_export = load_logs(st.session_state.project_id) if st.session_state.project_id else []
+    st.download_button("下载Excel整包", data=build_excel_package(st.session_state.records, logs_for_export), file_name="AI引导稽查交付整包.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True, disabled=not has_permission("export"))
 
 st.divider()
-with st.expander("V2升级说明"):
-    st.write("V2已加入SQLite本地数据库，可保存项目、步骤填写内容、发现记录和操作日志；加入内置知识库提示；加入CAPA自动生成页面。下一步可继续升级OCR识别、账号权限、后台规则配置和真实大模型接口。")
+with st.expander("V3升级说明"):
+    st.write("V3已加入本地账号权限、发现复核流、文件解析摘要、Excel整包导出和后台流程配置。下一步可继续接入真实OCR、大模型API、企业微信/飞书登录、云数据库和多人协作。")
