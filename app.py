@@ -34,6 +34,7 @@ from src.storage import (
     update_finding_review,
     update_project,
 )
+from src.ui_style import apply_tech_style, hero
 
 st.set_page_config(page_title="AI引导式稽查SOP执行系统", layout="wide")
 
@@ -42,29 +43,19 @@ if not login_box():
 
 init_db()
 init_session()
+apply_tech_style()
 logout_button()
 
 WORKFLOW = load_workflow_config()
 
-st.markdown("""
-<style>
-.block-container {padding-top: 1.2rem;}
-.step-card {border: 1px solid #d9e2ef; border-radius: 12px; padding: 16px; background: #f8fbff; margin-bottom: 12px;}
-.risk-high {color:#b00020; font-weight:700;}
-.risk-medium {color:#b36b00; font-weight:700;}
-.risk-low {color:#276749; font-weight:700;}
-.small-note {color:#64748b; font-size: 13px;}
-</style>
-""", unsafe_allow_html=True)
-
-st.title("AI引导式稽查SOP执行系统 V3")
-st.caption("已升级：账号权限 + 发现复核 + 文件解析 + Excel整包导出 + 后台流程配置。")
+hero(
+    "AI引导式稽查SOP执行系统 V3",
+    "蓝白科技风界面｜现场流程导航、证据链判断、发现复核、CAPA生成与交付整包导出一体化。",
+    "Clinical Trial Quality Intelligence",
+)
 
 st.session_state.setdefault("project_id", None)
 st.session_state.setdefault("selected_page", "现场引导")
-
-# 让guide_engine仍使用默认流程逻辑；V3配置主要用于页面展示和后续扩展。
-# 当前规则判断仍以guide_engine内置步骤ID为准，配置页可先用于调整提示和流程文案。
 
 with st.sidebar:
     st.header("项目管理")
@@ -115,7 +106,6 @@ with st.sidebar:
 
     st.divider()
     st.header("流程进度")
-    # 导航仍按guide_engine的当前步骤执行
     from src.guide_engine import DEFAULT_WORKFLOW
     for i, step_item in enumerate(DEFAULT_WORKFLOW):
         icon = "已完成" if i in st.session_state.done_steps else ("当前" if i == st.session_state.current_index else "待执行")
@@ -205,15 +195,25 @@ if st.session_state.selected_page == "项目日志":
     st.stop()
 
 step = get_current_step()
+
+records_count = len(st.session_state.records)
+done_count = len(st.session_state.done_steps)
+high_count = sum(1 for r in st.session_state.records if r.get("风险等级") == "高")
+col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+col_m1.metric("当前项目ID", st.session_state.project_id or "未保存")
+col_m2.metric("流程完成", f"{done_count}/{len(DEFAULT_WORKFLOW)}")
+col_m3.metric("发现记录", records_count)
+col_m4.metric("高风险", high_count)
+
 left, mid, right = st.columns([1.15, 1.7, 1.15], gap="large")
 
 with left:
-    st.subheader("当前任务卡")
     st.markdown(f"""
 <div class='step-card'>
-<b>模块：</b>{step['module']}<br>
+<div class='step-chip'>Current Step</div>
+<div class='step-title'>{step['module']}</div>
 <b>步骤：</b>{step['step_name']}<br>
-<b>现在做什么：</b>{step['instruction']}<br>
+<b>现在做什么：</b>{step['instruction']}
 </div>
 """, unsafe_allow_html=True)
 
@@ -242,12 +242,12 @@ with left:
             st.rerun()
 
 with mid:
-    st.subheader("AI逐步引导")
-    st.info(step["ai_prompt"])
+    st.markdown("<div class='panel-card'><div class='step-title'>AI逐步引导</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='info-strip'>{step['ai_prompt']}</div>", unsafe_allow_html=True)
 
     st.markdown("**知识库提示**")
     current_text = " ".join(str(v) for v in st.session_state.step_inputs.get(step["id"], {}).values())
-    st.markdown(build_guidance_text(step["module"], current_text))
+    st.markdown(f"<div class='kb-box'>{build_guidance_text(step['module'], current_text)}</div>", unsafe_allow_html=True)
 
     st.markdown("**请按提示填写或粘贴证据信息**")
     st.session_state.step_inputs.setdefault(step["id"], {})
@@ -296,9 +296,10 @@ with mid:
             if st.session_state.project_id:
                 save_finding(st.session_state.project_id, finding)
             st.success("已加入发现记录区。")
+    st.markdown("</div>", unsafe_allow_html=True)
 
 with right:
-    st.subheader("发现记录区")
+    st.markdown("<div class='panel-card'><div class='step-title'>发现记录区</div>", unsafe_allow_html=True)
     if st.session_state.project_id:
         st.session_state.records = load_findings(st.session_state.project_id)
     if not st.session_state.records:
@@ -317,7 +318,6 @@ with right:
     st.download_button("下载Word报告初稿", data=build_word_report(), file_name="AI引导式稽查报告初稿.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", use_container_width=True, disabled=not has_permission("export"))
     logs_for_export = load_logs(st.session_state.project_id) if st.session_state.project_id else []
     st.download_button("下载Excel整包", data=build_excel_package(st.session_state.records, logs_for_export), file_name="AI引导稽查交付整包.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True, disabled=not has_permission("export"))
+    st.markdown("</div>", unsafe_allow_html=True)
 
-st.divider()
-with st.expander("V3升级说明"):
-    st.write("V3已加入本地账号权限、发现复核流、文件解析摘要、Excel整包导出和后台流程配置。下一步可继续接入真实OCR、大模型API、企业微信/飞书登录、云数据库和多人协作。")
+st.markdown("<div class='footer-note'>提升质量，赋能上市｜AI Guided Audit SOP System</div>", unsafe_allow_html=True)
