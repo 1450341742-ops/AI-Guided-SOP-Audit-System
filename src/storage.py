@@ -82,6 +82,20 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS knowledge_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kb_name TEXT NOT NULL,
+                category TEXT NOT NULL,
+                file_name TEXT NOT NULL,
+                file_type TEXT,
+                summary TEXT,
+                tags TEXT DEFAULT '',
+                created_at TEXT NOT NULL
+            )
+            """
+        )
         ensure_column(conn, "findings", "review_status", "TEXT DEFAULT '待复核'")
         ensure_column(conn, "findings", "review_comment", "TEXT DEFAULT ''")
         ensure_column(conn, "findings", "reviewer", "TEXT DEFAULT ''")
@@ -225,6 +239,38 @@ def load_uploaded_files(project_id: int) -> List[Dict[str, Any]]:
     with get_conn() as conn:
         rows = conn.execute("SELECT * FROM uploaded_files WHERE project_id=? ORDER BY id DESC", (project_id,)).fetchall()
     return [dict(row) for row in rows]
+
+
+def save_knowledge_file(kb_name: str, category: str, file_name: str, file_type: str, summary: str, tags: str = "") -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO knowledge_files(kb_name, category, file_name, file_type, summary, tags, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (kb_name or "公司知识库", category or "未分类", file_name, file_type, summary, tags, now()),
+        )
+        conn.execute("INSERT INTO audit_logs(project_id, action, detail, created_at) VALUES (?, ?, ?, ?)", (None, "上传知识库", f"{kb_name}/{category}/{file_name}", now()))
+        conn.commit()
+
+
+def load_knowledge_files(keyword: str = "", category: str = "") -> List[Dict[str, Any]]:
+    query = "SELECT * FROM knowledge_files WHERE 1=1"
+    params: List[Any] = []
+    if keyword:
+        query += " AND (file_name LIKE ? OR summary LIKE ? OR tags LIKE ? OR kb_name LIKE ?)"
+        like = f"%{keyword}%"
+        params.extend([like, like, like, like])
+    if category and category != "全部":
+        query += " AND category=?"
+        params.append(category)
+    query += " ORDER BY id DESC LIMIT 300"
+    with get_conn() as conn:
+        rows = conn.execute(query, params).fetchall()
+    return [dict(row) for row in rows]
+
+
+def list_knowledge_categories() -> List[str]:
+    with get_conn() as conn:
+        rows = conn.execute("SELECT DISTINCT category FROM knowledge_files ORDER BY category").fetchall()
+    return [row["category"] for row in rows]
 
 
 def load_logs(project_id: Optional[int] = None) -> List[Dict[str, Any]]:
