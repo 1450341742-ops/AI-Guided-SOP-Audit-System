@@ -1,6 +1,8 @@
 from datetime import datetime
+import pandas as pd
 import streamlit as st
 
+from src.capa import build_capa_items
 from src.guide_engine import (
     DEFAULT_WORKFLOW,
     init_session,
@@ -13,8 +15,23 @@ from src.guide_engine import (
     export_records_dataframe,
     build_word_report,
 )
+from src.knowledge_base import build_guidance_text
+from src.storage import (
+    create_project,
+    get_project,
+    init_db,
+    list_projects,
+    load_findings,
+    load_logs,
+    load_step_inputs,
+    save_finding,
+    save_step_input,
+    update_project,
+)
 
 st.set_page_config(page_title="AI引导式稽查SOP执行系统", layout="wide")
+init_db()
+init_session()
 
 st.markdown("""
 <style>
@@ -23,15 +40,33 @@ st.markdown("""
 .risk-high {color:#b00020; font-weight:700;}
 .risk-medium {color:#b36b00; font-weight:700;}
 .risk-low {color:#276749; font-weight:700;}
+.small-note {color:#64748b; font-size: 13px;}
 </style>
 """, unsafe_allow_html=True)
 
-init_session()
+st.title("AI引导式稽查SOP执行系统 V2")
+st.caption("已升级：项目持久化保存 + 知识库提示 + CAPA生成 + 操作日志。")
 
-st.title("AI引导式稽查SOP执行系统")
-st.caption("流程驱动 + 规则判断 + 证据链记录 + 报告初稿生成。")
+st.session_state.setdefault("project_id", None)
+st.session_state.setdefault("selected_page", "现场引导")
 
 with st.sidebar:
+    st.header("项目管理")
+    projects = list_projects()
+    project_options = {f"{p['id']}｜{p['project_name']}｜{p.get('site_no','')}": p["id"] for p in projects}
+    selected = st.selectbox("打开历史项目", ["新建项目"] + list(project_options.keys()))
+    if selected != "新建项目" and st.button("加载项目", use_container_width=True):
+        pid = project_options[selected]
+        p = get_project(pid)
+        if p:
+            st.session_state.project_id = pid
+            st.session_state.project = p
+            st.session_state.step_inputs = load_step_inputs(pid)
+            st.session_state.records = load_findings(pid)
+            st.success("项目已加载")
+            st.rerun()
+
+    st.divider()
     st.header("项目设置")
     st.session_state.project.update({
         "project_name": st.text_input("项目名称", st.session_state.project.get("project_name", "")),
@@ -42,6 +77,22 @@ with st.sidebar:
         "subject_id": st.text_input("当前受试者编号", st.session_state.project.get("subject_id", "")),
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
     })
+    cnew, csave = st.columns(2)
+    with cnew:
+        if st.button("新建保存", use_container_width=True):
+            st.session_state.project_id = create_project(st.session_state.project)
+            st.success(f"已创建项目ID：{st.session_state.project_id}")
+    with csave:
+        if st.button("保存项目", use_container_width=True):
+            if st.session_state.project_id:
+                update_project(st.session_state.project_id, st.session_state.project)
+                st.success("已保存")
+            else:
+                st.warning("请先点击新建保存")
+
+    st.divider()
+    st.header("页面")
+    st.session_state.selected_page = st.radio("选择功能", ["现场引导", "CAPA计划", "项目日志"], label_visibility="collapsed")
 
     st.divider()
     st.header("流程进度")
@@ -50,6 +101,26 @@ with st.sidebar:
         if st.button(f"{icon}｜{i+1}. {step_item['module']}", key=f"nav_{i}", use_container_width=True):
             st.session_state.current_index = i
             st.rerun()
+
+if st.session_state.selected_page == "CAPA计划":
+    st.subheader("CAPA自动生成")
+    if not st.session_state.records:
+        st.info("暂无发现记录。请先在现场引导页面生成问题记录。")
+    else:
+        capa_items = build_capa_items(st.session_state.records)
+        capa_df = pd.DataFrame(capa_items)
+        st.dataframe(capa_df, use_container_width=True)
+        st.download_button("下载CAPA计划CSV", data=capa_df.to_csv(index=False).encode("utf-8-sig"), file_name="AI生成CAPA计划.csv", mime="text/csv")
+    st.stop()
+
+if st.session_state.selected_page == "项目日志":
+    st.subheader("项目操作日志")
+    if st.session_state.project_id:
+        logs = load_logs(st.session_state.project_id)
+        st.dataframe(pd.DataFrame(logs), use_container_width=True)
+    else:
+        st.info("请先加载或新建项目。")
+    st.stop()
 
 step = get_current_step()
 left, mid, right = st.columns([1.15, 1.7, 1.15], gap="large")
@@ -92,6 +163,10 @@ with mid:
     st.subheader("AI逐步引导")
     st.info(step["ai_prompt"])
 
+    st.markdown("**知识库提示**")
+    current_text = " ".join(str(v) for v in st.session_state.step_inputs.get(step["id"], {}).values())
+    st.markdown(build_guidance_text(step["module"], current_text))
+
     st.markdown("**请按提示填写或粘贴证据信息**")
     st.session_state.step_inputs.setdefault(step["id"], {})
     for field in step["fields"]:
@@ -104,6 +179,13 @@ with mid:
         else:
             value = st.text_input(field["label"], value=current_value, key=widget_key)
         st.session_state.step_inputs[step["id"]][field["key"]] = value
+
+    if st.button("保存当前步骤信息"):
+        if st.session_state.project_id:
+            save_step_input(st.session_state.project_id, step["id"], st.session_state.step_inputs[step["id"]])
+            st.success("当前步骤已保存到数据库")
+        else:
+            st.warning("请先新建保存项目")
 
     uploaded = st.file_uploader("可上传照片/截图/文件作为证据（当前版本保存文件名）", accept_multiple_files=True)
     if uploaded:
@@ -127,7 +209,10 @@ with mid:
                 for rule in result["triggered_rules"]:
                     st.write(f"- {rule}")
         if st.button("根据判断生成标准记录"):
-            st.session_state.records.append(build_finding_from_current_step(result))
+            finding = build_finding_from_current_step(result)
+            st.session_state.records.append(finding)
+            if st.session_state.project_id:
+                save_finding(st.session_state.project_id, finding)
             st.success("已加入发现记录区。")
 
 with right:
@@ -148,5 +233,5 @@ with right:
     st.download_button("下载Word报告初稿", data=build_word_report(), file_name="AI引导式稽查报告初稿.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", use_container_width=True)
 
 st.divider()
-with st.expander("开发说明 / 后续扩展"):
-    st.write("当前版本为可运行MVP：包含流程导航、任务卡、字段采集、规则判断、补充追问、证据链记录、问题清单和Word报告导出。后续可接入OCR、知识库、大模型、EDC自动解析、权限和数据库。")
+with st.expander("V2升级说明"):
+    st.write("V2已加入SQLite本地数据库，可保存项目、步骤填写内容、发现记录和操作日志；加入内置知识库提示；加入CAPA自动生成页面。下一步可继续升级OCR识别、账号权限、后台规则配置和真实大模型接口。")
